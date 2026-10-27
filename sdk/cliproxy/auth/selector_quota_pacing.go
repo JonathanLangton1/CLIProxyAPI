@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net/http"
 	"sort"
@@ -173,25 +174,22 @@ func (s *QuotaPacingSelector) Pick(ctx context.Context, provider, model string, 
 	}
 	s.pruneStatesLocked(now)
 
-	entry := selectorLogEntry(ctx).WithField("tier", quotaTierNames[bestTier])
+	// The host log formatter prints only a few known fields, so the details go in the message.
+	details := ""
 	if picked.windows != nil {
 		if picked.windows.short != nil {
-			entry = entry.WithField("short_used", round2(picked.windows.short.utilization))
+			details += fmt.Sprintf(" 5h_used=%.2f", picked.windows.short.utilization)
 		}
 		if picked.windows.long != nil {
-			entry = entry.WithFields(map[string]any{
-				"long_used":     round2(picked.windows.long.utilization),
-				"long_reset_in": picked.windows.long.resetAt.Sub(now).Round(time.Minute).String(),
-			})
+			details += fmt.Sprintf(" week_used=%.2f week_reset_in=%s", picked.windows.long.utilization,
+				picked.windows.long.resetAt.Sub(now).Round(time.Minute))
 		}
 		if picked.tier == quotaTierHealthy || picked.tier == quotaTierPressured {
-			entry = entry.WithFields(map[string]any{
-				"urgency_per_hour": math.Round(picked.urgency*10000) / 10000,
-				"short_projected":  round2(picked.shortLoad),
-			})
+			details += fmt.Sprintf(" urgency=%.4f/h 5h_projected=%.2f", picked.urgency, picked.shortLoad)
 		}
 	}
-	entry.Infof("quota-pacing: picked auth=%s provider=%s model=%s candidates=%d", picked.auth.ID, provider, model, len(available))
+	selectorLogEntry(ctx).Infof("quota-pacing: picked auth=%s tier=%s%s provider=%s model=%s candidates=%d",
+		picked.auth.ID, quotaTierNames[bestTier], details, provider, model, len(available))
 	return picked.auth, nil
 }
 
@@ -545,10 +543,6 @@ func pruneQuotaAdmissions(admissions []time.Time, now time.Time) []time.Time {
 
 func hoursUntil(at, now time.Time) float64 {
 	return math.Max(0, at.Sub(now).Hours())
-}
-
-func round2(value float64) float64 {
-	return math.Round(value*100) / 100
 }
 
 // parseQuotaWindows reads the provider's usage windows from a passive quota snapshot. It
