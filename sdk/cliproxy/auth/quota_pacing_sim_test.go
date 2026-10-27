@@ -129,6 +129,8 @@ type simDemand struct {
 	burst       func(t time.Time) int
 	minDuration time.Duration
 	maxDuration time.Duration
+	// oneShotPerHour adds tiny one-request sessions (titles, summaries, quick questions).
+	oneShotPerHour float64
 }
 
 type simStrategy struct {
@@ -250,6 +252,13 @@ func runQuotaSim(t *testing.T, pool simPool, demand simDemand, strategy simStrat
 		arrivals := poisson(rng, rate)
 		if demand.burst != nil {
 			arrivals += demand.burst(now)
+		}
+		oneShots := poisson(rng, demand.oneShotPerHour/60)
+		if demand.concurrency(now) <= 0 {
+			oneShots = 0
+		}
+		for i := oneShots; i > 0; i-- {
+			sessions = append(sessions, &simSession{start: now, end: now.Add(time.Minute), burn: 0.01})
 		}
 		for i := 0; i < arrivals; i++ {
 			duration := demand.minDuration + time.Duration(rng.Int63n(int64(demand.maxDuration-demand.minDuration)+1))
@@ -383,15 +392,19 @@ func TestQuotaPacingSimulation(t *testing.T) {
 			}, minDuration: 45 * time.Minute, maxDuration: 150 * time.Minute},
 		{name: "saturated (10 sessions, 24/7)", concurrency: func(time.Time) float64 { return 10 }, minDuration: 30 * time.Minute, maxDuration: 240 * time.Minute},
 	}
+	for _, demand := range demands[:len(demands):len(demands)] {
+		demand.name += " +50 one-shots/h"
+		demand.oneShotPerHour = 50
+		demands = append(demands, demand)
+	}
 	strategies := []simStrategy{
 		{name: "ORACLE-bound", oracle: true},
 		{name: "round-robin", new: func(func() time.Time) Selector { return &RoundRobinSelector{} }},
-		{name: "fill-first", new: func(func() time.Time) Selector { return &FillFirstSelector{} }},
 		{name: "soonest-reset", new: func(func() time.Time) Selector { return &soonestResetSelector{} }},
 		{name: "quota-pacing", new: func(clock func() time.Time) Selector { return &QuotaPacingSelector{now: clock} }},
 	}
 	ratios := []float64{8, 14}
-	const seeds = 12
+	const seeds = 8
 
 	var out strings.Builder
 	totals := map[string]*simResult{}

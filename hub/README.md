@@ -19,7 +19,8 @@ Sessions already on an account stay there (session affinity), so their prompt ca
    account most at risk of losing weekly quota takes most new sessions, but a burst that arrives
    before any response has updated the readings isn't piled onto one 5-hour window.
 2. **5-hour window: avoid mass failovers.** Each account's 5-hour use at its next reset is
-   projected from its current burn rate, plus 5% for each session admitted in the last 15 minutes.
+   projected from its current burn rate, plus 5% for each session admitted in the last 5 minutes
+   (capped at 25%, so the burst of rebinds after a restart can't flip every account to pressured).
    An account in any of these states only gets new sessions when every account is in one of them:
    - projected to run out before its 5-hour reset;
    - 5-hour window 95% used;

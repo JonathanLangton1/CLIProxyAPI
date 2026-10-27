@@ -467,3 +467,22 @@ func TestQuotaPacing_LongRateSurvivesFrequentObservations(t *testing.T) {
 		t.Fatalf("long rate = %.4f/h from %d samples, want about 0.05", rate, len(state.longSamples))
 	}
 }
+
+func TestQuotaPacing_RestartRebindStormDoesNotFlipAccountsToPressured(t *testing.T) {
+	t.Parallel()
+	clock := &quotaTestClock{now: quotaTestNow}
+	selector := newQuotaTestSelector(clock)
+	a := claudeQuotaAuth("a", quotaTestNow, 0.14, 3*time.Hour, 0.50, 21*time.Hour)
+	b := claudeQuotaAuth("b", quotaTestNow, 0.25, 2*time.Hour, 0.38, 77*time.Hour)
+	// After a restart every open conversation rebinds within a minute.
+	for i := 0; i < 40; i++ {
+		mustPick(t, selector, sessionOpts(fmt.Sprintf("rebind-%d", i)), a, b)
+	}
+	selector.mu.Lock()
+	defer selector.mu.Unlock()
+	for _, auth := range []*Auth{a, b} {
+		if candidate := selector.classifyLocked(auth, clock.now); candidate.tier != quotaTierHealthy {
+			t.Fatalf("%s tier = %s (short load %.2f), want healthy", auth.ID, quotaTierNames[candidate.tier], candidate.shortLoad)
+		}
+	}
+}

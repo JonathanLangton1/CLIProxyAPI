@@ -51,10 +51,13 @@ const (
 	// quotaPacingShortLoadTie treats short-window loads this close as equal.
 	quotaPacingShortLoadTie = 0.02
 	// quotaPacingAdmissionLoad is the short-window share one newly admitted session is assumed
-	// to consume before its own responses show up in the observed utilization. It spreads a
-	// burst of new sessions instead of sending all of them to one credential.
+	// to consume before its own responses show up in the observed burn rate, which takes a few
+	// minutes. It spreads a burst of new sessions instead of sending all of them to one
+	// credential. The total is capped: after a restart every open conversation rebinds at once,
+	// and their load is already in the observed rate.
 	quotaPacingAdmissionLoad = 0.05
-	quotaPacingAdmissionTTL  = 15 * time.Minute
+	quotaPacingAdmissionCap  = 0.25
+	quotaPacingAdmissionTTL  = 5 * time.Minute
 	// A credential is pressured when its short window is projected to run out before reset,
 	// is nearly used, or its long window is nearly used.
 	quotaPacingShortNearCap = 0.95
@@ -262,7 +265,7 @@ func (s *QuotaPacingSelector) classifyLocked(auth *Auth, now time.Time) quotaPac
 	}
 
 	state.admissions = pruneQuotaAdmissions(state.admissions, now)
-	candidate.shortLoad = float64(len(state.admissions)) * quotaPacingAdmissionLoad
+	candidate.shortLoad = math.Min(float64(len(state.admissions))*quotaPacingAdmissionLoad, quotaPacingAdmissionCap)
 	if windows.short != nil {
 		rate := shortWindowRate(state.shortSamples, windows.short, windows.observedAt, now)
 		candidate.shortLoad += windows.short.utilization + rate*hoursUntil(windows.short.resetAt, now)
