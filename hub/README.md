@@ -77,15 +77,19 @@ demand over accounts in order of weekly reset, with no session stickiness and no
 go test -tags quotasim -run TestQuotaPacingSimulation -v ./sdk/cliproxy/auth/
 ```
 
-Results on 2026-10-27 (4 account setups × 5 demand patterns × 2 week/5h ratios × 12 seeds), as a
-share of the theoretical best:
+Results on 2026-10-27 for the deployed version. That's 80 scenarios: 4 account setups × 5 demand
+patterns, each with and without 50 one-shot sessions an hour, × 2 week/5h ratios, × 8 seeds.
 
-| Strategy | Share of best | Failovers |
-|---|---|---|
-| quota-pacing | 97.99% | 1932 |
-| round-robin | 97.47% | 2001 |
-| soonest-reset | 96.36% | 4233 |
-| fill-first | 94.93% | 4864 |
+| Strategy | Share of best | Best or tied | Failovers |
+|---|---|---|---|
+| quota-pacing | 98.27% | 73/80 | 3471 |
+| round-robin | 97.57% | 45/80 | 3946 |
+| soonest-reset | 96.45% | 32/80 | 8368 |
 
-Greedy, earliest-deadline and cubed-weight rankings for healthy accounts were also tried. They
-scored 97.4–97.9%, so the weighted rotation stays.
+Other rankings for healthy accounts scored 97.4–97.9%:
+- greedy;
+- earliest-deadline;
+- cubed weights.
+
+Admission windows of 15 minutes uncapped, 5 minutes uncapped, and none at all scored at or below
+the shipped 5 minutes capped at 25%.
