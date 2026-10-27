@@ -65,3 +65,26 @@ Laptops never run the proxy. Point a new machine at the hub with:
 ```bash
 bash <(ssh home-server cat cliproxyapi/laptop-setup.sh)
 ```
+
+## Simulation
+
+`sdk/cliproxy/auth/quota_pacing_sim_test.go` replays 14 days of synthetic Claude Code traffic
+against the real selectors and compares them with a theoretical best, which spreads each minute's
+demand over accounts in order of weekly reset, with no session stickiness and no cache cost:
+
+```bash
+go test -tags quotasim -run TestQuotaPacingSimulation -v ./sdk/cliproxy/auth/
+```
+
+Results on 2026-10-27 (4 account setups × 5 demand patterns × 2 week/5h ratios × 12 seeds), as a
+share of the theoretical best:
+
+| Strategy | Share of best | Failovers |
+|---|---|---|
+| quota-pacing | 97.99% | 1932 |
+| round-robin | 97.47% | 2001 |
+| soonest-reset | 96.36% | 4233 |
+| fill-first | 94.93% | 4864 |
+
+Greedy, earliest-deadline and cubed-weight rankings for healthy accounts were also tried. They
+scored 97.4–97.9%, so the weighted rotation stays.
