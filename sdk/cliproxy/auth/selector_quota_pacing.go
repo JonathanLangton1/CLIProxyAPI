@@ -27,6 +27,7 @@ import (
 type QuotaPacingSelector struct {
 	mu         sync.Mutex
 	lastPicked map[string]string
+	strides    map[string]map[string]float64
 	states     map[string]*quotaPacingState
 
 	// now overrides the clock in tests.
@@ -38,9 +39,14 @@ const (
 	quotaPacingLongWindowMin = 24 * time.Hour
 	// quotaPacingUrgencyHorizonMin bounds urgency for windows about to reset.
 	quotaPacingUrgencyHorizonMin = time.Hour
-	// quotaPacingUrgencyBand keeps credentials within this fraction of the best urgency in
-	// contention, so near-equal credentials share new work instead of herding onto one.
+	// quotaPacingUrgencyBand keeps pressured credentials within this fraction of the best
+	// urgency in contention.
 	quotaPacingUrgencyBand = 0.10
+	// quotaPacingUrgencyFloor keeps a credential whose remaining week is already covered by its
+	// bound sessions in the weighted rotation with a small share.
+	quotaPacingUrgencyFloor = 0.0005
+	// quotaPacingHeadroomFloor is the smallest short-window headroom used as a weight factor.
+	quotaPacingHeadroomFloor = 0.05
 	// quotaPacingShortLoadTie treats short-window loads this close as equal.
 	quotaPacingShortLoadTie = 0.02
 	// quotaPacingAdmissionLoad is the short-window share one newly admitted session is assumed
@@ -51,7 +57,7 @@ const (
 	// A credential is pressured when its short window is projected to run out before reset,
 	// is nearly used, or its long window is nearly used.
 	quotaPacingShortNearCap = 0.95
-	quotaPacingLongNearCap  = 0.98
+	quotaPacingLongNearCap  = 0.95
 	// Short-window burn rate: slope between observations of the same window, or the average
 	// since the window opened when the history is too short.
 	quotaPacingShortRateLookback = 45 * time.Minute
@@ -289,9 +295,7 @@ func (s *QuotaPacingSelector) pickWithinTierLocked(rotationKey string, tier int,
 	contenders := candidates
 	switch tier {
 	case quotaTierHealthy:
-		// Most urgent first, then the most short-window headroom among near-equals.
-		contenders = filterQuotaCandidates(contenders, urgencyBand(contenders))
-		contenders = filterQuotaCandidates(contenders, lowestShortLoad(contenders))
+		return s.pickWeightedLocked(rotationKey, contenders)
 	case quotaTierPressured:
 		// Every option is short on room: keep failovers rare by taking the most headroom.
 		contenders = filterQuotaCandidates(contenders, lowestShortLoad(contenders))
@@ -324,6 +328,46 @@ func (s *QuotaPacingSelector) pickWithinTierLocked(rotationKey string, tier int,
 		}
 	}
 	return contenders[0]
+}
+
+// pickWeightedLocked shares new work among healthy credentials by smooth weighted rotation.
+// The weight is weekly urgency times short-window headroom: the credential most at risk of
+// losing weekly quota takes most new sessions, but a burst that arrives before any response
+// updates the snapshot is spread instead of piled onto one short window.
+func (s *QuotaPacingSelector) pickWeightedLocked(rotationKey string, candidates []quotaPacingCandidate) quotaPacingCandidate {
+	if s.strides == nil || len(s.strides) >= quotaPacingMaxStates {
+		s.strides = make(map[string]map[string]float64)
+	}
+	current := s.strides[rotationKey]
+	if current == nil {
+		current = make(map[string]float64, len(candidates))
+		s.strides[rotationKey] = current
+	}
+	present := make(map[string]struct{}, len(candidates))
+	total := 0.0
+	for _, candidate := range candidates {
+		weight := (math.Max(candidate.urgency, 0) + quotaPacingUrgencyFloor) *
+			math.Max(1-candidate.shortLoad, quotaPacingHeadroomFloor)
+		current[candidate.auth.ID] += weight
+		total += weight
+		present[candidate.auth.ID] = struct{}{}
+	}
+	for id := range current {
+		if _, ok := present[id]; !ok {
+			delete(current, id)
+		}
+	}
+	best := 0
+	for i, candidate := range candidates[1:] {
+		bestID := candidates[best].auth.ID
+		if current[candidate.auth.ID] > current[bestID] ||
+			(current[candidate.auth.ID] == current[bestID] && candidate.auth.ID < bestID) {
+			best = i + 1
+		}
+	}
+	current[candidates[best].auth.ID] -= total
+	s.lastPicked[rotationKey] = candidates[best].auth.ID
+	return candidates[best]
 }
 
 func filterQuotaCandidates(candidates []quotaPacingCandidate, keep func(quotaPacingCandidate) bool) []quotaPacingCandidate {

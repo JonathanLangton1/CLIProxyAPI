@@ -141,9 +141,29 @@ func TestQuotaPacing_PrefersWeeklyQuotaAtRisk(t *testing.T) {
 	// A: half its week left, resets in 21h. B: 62% left, resets in 77h.
 	a := claudeQuotaAuth("a", quotaTestNow, 0.10, 4*time.Hour, 0.50, 21*time.Hour)
 	b := claudeQuotaAuth("b", quotaTestNow, 0.10, 4*time.Hour, 0.38, 77*time.Hour)
-	for i := 0; i < 3; i++ {
-		if got := mustPick(t, selector, cliproxyexecutor.Options{}, b, a); got != "a" {
-			t.Fatalf("pick %d = %q, want a", i, got)
+	if got := mustPick(t, selector, cliproxyexecutor.Options{}, b, a); got != "a" {
+		t.Fatalf("first pick = %q, want a", got)
+	}
+	counts := map[string]int{"a": 1}
+	for i := 0; i < 7; i++ {
+		counts[mustPick(t, selector, cliproxyexecutor.Options{}, b, a)]++
+	}
+	// A's urgency is about three times B's: it takes most, but not all, new work.
+	if counts["a"] < 5 || counts["b"] < 1 {
+		t.Fatalf("distribution = %v, want roughly 3:1 in favour of a", counts)
+	}
+}
+
+func TestQuotaPacing_WeeklyNearCapStopsTakingNewWork(t *testing.T) {
+	t.Parallel()
+	clock := &quotaTestClock{now: quotaTestNow}
+	selector := newQuotaTestSelector(clock)
+	// A has 3% of its week left and resets in 2h: a burst there would hit the weekly cap.
+	a := claudeQuotaAuth("a", quotaTestNow, 0.05, 4*time.Hour, 0.97, 2*time.Hour)
+	b := claudeQuotaAuth("b", quotaTestNow, 0.05, 4*time.Hour, 0.38, 77*time.Hour)
+	for i := 0; i < 4; i++ {
+		if got := mustPick(t, selector, sessionOpts(fmt.Sprintf("s%d", i)), a, b); got != "b" {
+			t.Fatalf("pick %d = %q, want b", i, got)
 		}
 	}
 }
@@ -291,8 +311,11 @@ func TestQuotaPacing_KeepsLastKnownWindowsWhenSnapshotLacksThem(t *testing.T) {
 	// A later response carried only Retry-After, which replaced A's snapshot.
 	a.Quota = QuotaState{ObservedAt: quotaTestNow.Add(time.Minute), Signals: map[string]string{"Retry-After": "5"}}
 	clock.now = quotaTestNow.Add(2 * time.Minute)
-	if got := mustPick(t, selector, cliproxyexecutor.Options{}, a, b); got != "a" {
-		t.Fatalf("pick = %q, want a from its last known windows", got)
+	selector.mu.Lock()
+	candidate := selector.classifyLocked(a, clock.now)
+	selector.mu.Unlock()
+	if candidate.tier != quotaTierHealthy || candidate.windows == nil || candidate.windows.long == nil || candidate.windows.long.utilization != 0.50 {
+		t.Fatalf("classify = tier %s windows %+v, want healthy from its last known windows", quotaTierNames[candidate.tier], candidate.windows)
 	}
 }
 

@@ -15,12 +15,17 @@ Sessions already on an account stay there (session affinity), so their prompt ca
 
    `(1 - used) / hours_to_reset - current_burn_rate`
 
-   New sessions go to the most urgent account. Accounts within 10% of the top urgency share new
-   sessions.
+   New sessions are shared by smooth weighted rotation, weighted by urgency × 5-hour headroom. The
+   account most at risk of losing weekly quota takes most new sessions, but a burst that arrives
+   before any response has updated the readings isn't piled onto one 5-hour window.
 2. **5-hour window: avoid mass failovers.** Each account's 5-hour use at its next reset is
    projected from its current burn rate, plus 5% for each session admitted in the last 15 minutes.
-   An account projected to run out, or already 95% used, only gets new sessions when every account
-   is in that state.
+   An account in any of these states only gets new sessions when every account is in one of them:
+   - projected to run out before its 5-hour reset;
+   - 5-hour window 95% used;
+   - weekly window 95% used.
+
+   Among such accounts, the one with the most 5-hour room goes first.
 3. **Safety rules:**
    - Accounts with no data yet get one probe session every 10 minutes.
    - Rejected accounts go last, ordered by earliest recovery.
