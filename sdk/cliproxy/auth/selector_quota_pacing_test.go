@@ -42,8 +42,12 @@ func claudeQuotaAuth(id string, observedAt time.Time, used5h float64, reset5hIn 
 	}
 }
 
+// sessionOpts mimics a session-affinity fallback call for a new session.
 func sessionOpts(id string) cliproxyexecutor.Options {
-	return cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.CanonicalSessionIDMetadataKey: id}}
+	return cliproxyexecutor.Options{Metadata: map[string]any{
+		cliproxyexecutor.SessionAffinityProviderMetadataKey: "claude",
+		cliproxyexecutor.CanonicalSessionIDMetadataKey:      id,
+	}}
 }
 
 func mustPick(t *testing.T, selector Selector, opts cliproxyexecutor.Options, auths ...*Auth) string {
@@ -392,5 +396,74 @@ func TestQuotaPacing_SessionAffinityKeepsBoundSessions(t *testing.T) {
 	// A becomes unavailable: the bound session fails over to B.
 	if got := mustPick(t, selector, session, b); got != "b" {
 		t.Fatalf("failover = %q, want b", got)
+	}
+}
+
+func TestQuotaPacing_CodexLimitFlagClearsWhenItsWindowResets(t *testing.T) {
+	t.Parallel()
+	signals := map[string]string{
+		"X-Codex-Primary-Used-Percent":     "100",
+		"X-Codex-Primary-Window-Minutes":   "300",
+		"X-Codex-Primary-Reset-At":         unixString(quotaTestNow.Add(time.Hour)),
+		"X-Codex-Secondary-Used-Percent":   "40",
+		"X-Codex-Secondary-Window-Minutes": "10080",
+		"X-Codex-Secondary-Reset-At":       unixString(quotaTestNow.Add(100 * time.Hour)),
+		"X-Codex-Limit-Reached":            "true",
+	}
+	windows := parseQuotaWindows("codex", signals, quotaTestNow)
+	if recoverAt, rejected := windows.at(quotaTestNow).rejection(); !rejected || !recoverAt.Equal(quotaTestNow.Add(time.Hour)) {
+		t.Fatalf("rejection = %v, %v; want rejected until the 5h reset", recoverAt, rejected)
+	}
+	if _, rejected := windows.at(quotaTestNow.Add(2 * time.Hour)).rejection(); rejected {
+		t.Fatal("still rejected after the full 5h window reset")
+	}
+
+	// A refusal with no full window is pinned on the shortest window.
+	signals["X-Codex-Primary-Used-Percent"] = "90"
+	windows = parseQuotaWindows("codex", signals, quotaTestNow)
+	if !windows.short.rejected || windows.long.rejected {
+		t.Fatalf("short rejected=%v long rejected=%v, want only the short window", windows.short.rejected, windows.long.rejected)
+	}
+}
+
+func TestQuotaPacing_SessionAffinityCountsAdmissions(t *testing.T) {
+	t.Parallel()
+	clock := &quotaTestClock{now: quotaTestNow}
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: newQuotaTestSelector(clock),
+		TTL:      time.Hour,
+	})
+	defer selector.Stop()
+	// A is far more urgent, but its 5h window is 60% used: the burst must spill to B.
+	a := claudeQuotaAuth("a", quotaTestNow, 0.60, 30*time.Minute, 0.50, 21*time.Hour)
+	b := claudeQuotaAuth("b", quotaTestNow, 0.05, 4*time.Hour, 0.20, 140*time.Hour)
+	counts := map[string]int{}
+	for i := 0; i < 12; i++ {
+		opts := cliproxyexecutor.Options{OriginalRequest: []byte(fmt.Sprintf(`{"metadata":{"user_id":"user_x_account__session_burst-%d"}}`, i))}
+		counts[mustPick(t, selector, opts, a, b)]++
+	}
+	if counts["b"] < 4 {
+		t.Fatalf("burst distribution = %v, want admissions to push new sessions onto b", counts)
+	}
+}
+
+func TestQuotaPacing_LongRateSurvivesFrequentObservations(t *testing.T) {
+	t.Parallel()
+	clock := &quotaTestClock{now: quotaTestNow}
+	selector := newQuotaTestSelector(clock)
+	// An observation every 15s for an hour while the week is used at 5% per hour.
+	for i := 0; i <= 240; i++ {
+		at := quotaTestNow.Add(time.Duration(i) * 15 * time.Second)
+		clock.now = at
+		used := 0.40 + 0.05*float64(i)/240
+		auth := claudeQuotaAuth("a", at, 0.10, 4*time.Hour, used, 30*time.Hour-time.Duration(i)*15*time.Second)
+		selector.mu.Lock()
+		selector.classifyLocked(auth, at)
+		selector.mu.Unlock()
+	}
+	state := selector.states["a"]
+	rate := longWindowRate(state.longSamples, state.windows.long, state.windows.observedAt, clock.now)
+	if rate < 0.04 || rate > 0.06 {
+		t.Fatalf("long rate = %.4f/h from %d samples, want about 0.05", rate, len(state.longSamples))
 	}
 }

@@ -71,6 +71,9 @@ const (
 	// A credential without usable quota data is preferred once per probe interval so it
 	// reports its windows, without starving credentials that already have data.
 	quotaPacingProbeInterval = 10 * time.Minute
+	// Samples are kept at least this far apart so the history spans the long-rate lookback
+	// even when responses arrive every few seconds.
+	quotaPacingSampleSpacing = 3 * time.Minute
 	quotaPacingMaxSamples    = 64
 	quotaPacingMaxStates     = 1024
 	quotaPacingStateTTL      = 48 * time.Hour
@@ -97,10 +100,9 @@ type quotaWindow struct {
 }
 
 type quotaWindows struct {
-	observedAt   time.Time
-	short        *quotaWindow
-	long         *quotaWindow
-	limitReached bool
+	observedAt time.Time
+	short      *quotaWindow
+	long       *quotaWindow
 }
 
 type quotaSample struct {
@@ -138,9 +140,6 @@ func (s *QuotaPacingSelector) Pick(ctx context.Context, provider, model string, 
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.states == nil {
-		s.states = make(map[string]*quotaPacingState)
-	}
 	if s.lastPicked == nil {
 		s.lastPicked = make(map[string]string)
 	}
@@ -166,7 +165,10 @@ func (s *QuotaPacingSelector) Pick(ctx context.Context, provider, model string, 
 	if bestTier == quotaTierProbe {
 		state.lastProbe = now
 	}
-	if sessionMetadataString(opts.Metadata, cliproxyexecutor.CanonicalSessionIDMetadataKey) != "" {
+	// Under session affinity this selector only runs for new bindings, failover rebinds and
+	// session-less requests, so each pick adds load the snapshot has not seen yet. Used
+	// directly, it runs for every request and admissions would only measure request volume.
+	if sessionMetadataString(opts.Metadata, cliproxyexecutor.SessionAffinityProviderMetadataKey) != "" {
 		state.admissions = append(pruneQuotaAdmissions(state.admissions, now), now)
 	}
 	s.pruneStatesLocked(now)
@@ -201,6 +203,9 @@ func (s *QuotaPacingSelector) clock() time.Time {
 }
 
 func (s *QuotaPacingSelector) stateLocked(authID string, now time.Time) *quotaPacingState {
+	if s.states == nil {
+		s.states = make(map[string]*quotaPacingState)
+	}
 	state := s.states[authID]
 	if state == nil {
 		state = &quotaPacingState{}
@@ -412,13 +417,7 @@ func quotaPacingCapable(auth *Auth, provider string) bool {
 
 // at returns the windows as they stand at now: a window whose reset has passed starts over.
 func (w *quotaWindows) at(now time.Time) *quotaWindows {
-	out := &quotaWindows{observedAt: w.observedAt, limitReached: w.limitReached}
-	out.short = w.short.at(now)
-	out.long = w.long.at(now)
-	if out.limitReached && (out.short == nil || out.short.rolled) && (out.long == nil || out.long.rolled) {
-		out.limitReached = false
-	}
-	return out
+	return &quotaWindows{observedAt: w.observedAt, short: w.short.at(now), long: w.long.at(now)}
 }
 
 func (w *quotaWindow) at(now time.Time) *quotaWindow {
@@ -445,14 +444,6 @@ func (w *quotaWindows) rejection() (time.Time, bool) {
 		if window != nil && window.rejected {
 			rejected = true
 			if window.resetAt.After(recoverAt) {
-				recoverAt = window.resetAt
-			}
-		}
-	}
-	if w.limitReached && !rejected {
-		rejected = true
-		for _, window := range []*quotaWindow{w.short, w.long} {
-			if window != nil && !window.rolled && window.resetAt.After(recoverAt) {
 				recoverAt = window.resetAt
 			}
 		}
@@ -520,7 +511,14 @@ func appendQuotaSample(samples []quotaSample, window *quotaWindow, at time.Time)
 	if window == nil {
 		return samples
 	}
-	samples = append(samples, quotaSample{at: at, utilization: window.utilization, resetAt: window.resetAt})
+	sample := quotaSample{at: at, utilization: window.utilization, resetAt: window.resetAt}
+	if n := len(samples); n >= 2 && at.Sub(samples[n-2].at) < quotaPacingSampleSpacing &&
+		sameQuotaReset(samples[n-1].resetAt, window.resetAt) {
+		// Too close to the previous kept sample: refresh the latest one instead.
+		samples[n-1] = sample
+	} else {
+		samples = append(samples, sample)
+	}
 	cutoff := at.Add(-quotaPacingLongRateLookback)
 	drop := 0
 	for drop < len(samples)-1 && samples[drop].at.Before(cutoff) {
@@ -612,7 +610,26 @@ func parseQuotaWindows(provider string, signals map[string]string, observedAt ti
 	if len(windows) == 0 {
 		return nil
 	}
-	out := &quotaWindows{observedAt: observedAt, limitReached: limitReached}
+	if limitReached {
+		// Attribute a provider-wide refusal to the windows that are full, so it clears when
+		// they reset. With no full window, blame the shortest one: it resets first.
+		attributed := false
+		for _, window := range windows {
+			if window.utilization >= 1 {
+				window.rejected, attributed = true, true
+			}
+		}
+		if !attributed {
+			shortest := windows[0]
+			for _, window := range windows[1:] {
+				if window.length < shortest.length {
+					shortest = window
+				}
+			}
+			shortest.rejected = true
+		}
+	}
+	out := &quotaWindows{observedAt: observedAt}
 	for _, window := range windows {
 		if window.length < quotaPacingLongWindowMin {
 			// The most used short window is the one that runs out first.

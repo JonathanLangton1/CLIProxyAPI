@@ -44,13 +44,46 @@ watch_service() {
 	return 0
 }
 
-log "deploy start: $NEW_BINARY (strategy $STRATEGY)"
-cp -p "$LIVE" "$PREV_BINARY"
-cp -p "$CONFIG" "$PREV_CONFIG"
-[ -e "$INSTALL_DIR/fork-builds/cli-proxy-api.stock" ] || cp -p "$LIVE" "$INSTALL_DIR/fork-builds/cli-proxy-api.stock"
+restore() {
+	log "restoring $PREV_BINARY and $PREV_CONFIG"
+	systemctl --user stop "$SERVICE"
+	cp "$PREV_BINARY" "$LIVE.new" && chmod 755 "$LIVE.new" && mv -f "$LIVE.new" "$LIVE" || log "restore: binary copy failed"
+	cp -p "$PREV_CONFIG" "$CONFIG" || log "restore: config copy failed"
+	systemctl --user start "$SERVICE"
+	if watch_service; then
+		log "rollback ok"
+	else
+		log "rollback FAILED: service still unhealthy"
+	fi
+}
 
-cp "$NEW_BINARY" "$LIVE.new" && chmod 755 "$LIVE.new" && mv -f "$LIVE.new" "$LIVE"
-sed -i -E "0,/^(\s*strategy:\s*)\"[^\"]*\"/s//\1\"$STRATEGY\"/" "$CONFIG"
+log "deploy start: $NEW_BINARY (strategy $STRATEGY)"
+# Verified backups first: nothing is changed unless both copies are byte-identical.
+if ! { cp -p "$LIVE" "$PREV_BINARY" && cmp -s "$LIVE" "$PREV_BINARY" &&
+	cp -p "$CONFIG" "$PREV_CONFIG" && cmp -s "$CONFIG" "$PREV_CONFIG"; }; then
+	log "deploy aborted: could not back up the live binary and config; nothing changed"
+	exit 1
+fi
+if [ ! -e "$INSTALL_DIR/fork-builds/cli-proxy-api.stock" ]; then
+	cp -p "$LIVE" "$INSTALL_DIR/fork-builds/cli-proxy-api.stock" || log "warning: could not keep a stock copy"
+fi
+
+# Stage both replacements before touching the live files.
+NEW_CONFIG="$CONFIG.deploy-new"
+if ! { cp "$NEW_BINARY" "$LIVE.new" && chmod 755 "$LIVE.new" && cmp -s "$NEW_BINARY" "$LIVE.new" &&
+	cp -p "$CONFIG" "$NEW_CONFIG" &&
+	sed -i -E "0,/^(\s*strategy:\s*)\"[^\"]*\"/s//\1\"$STRATEGY\"/" "$NEW_CONFIG" &&
+	grep -q -E "^\s*strategy:\s*\"$STRATEGY\"" "$NEW_CONFIG"; }; then
+	rm -f "$LIVE.new" "$NEW_CONFIG"
+	log "deploy aborted: could not stage the new binary or config; nothing changed"
+	exit 1
+fi
+
+if ! { mv -f "$LIVE.new" "$LIVE" && mv -f "$NEW_CONFIG" "$CONFIG"; }; then
+	log "deploy failed while installing files"
+	restore
+	exit 1
+fi
 log "routing line now: $(grep -m1 -E '^\s*strategy:' "$CONFIG" | sed 's/#.*//')"
 systemctl --user restart "$SERVICE"
 
@@ -59,15 +92,7 @@ if watch_service; then
 	exit 0
 fi
 
-log "deploy FAILED; rolling back to $PREV_BINARY"
+log "deploy FAILED; rolling back"
 journalctl --user -u "$SERVICE" --since "-3 min" --no-pager | grep -v -E 'gin_logger|session-affinity' | tail -30
-systemctl --user stop "$SERVICE"
-cp "$PREV_BINARY" "$LIVE.new" && chmod 755 "$LIVE.new" && mv -f "$LIVE.new" "$LIVE"
-cp -p "$PREV_CONFIG" "$CONFIG"
-systemctl --user start "$SERVICE"
-if watch_service; then
-	log "rollback ok"
-else
-	log "rollback FAILED: service still unhealthy"
-fi
+restore
 exit 1
